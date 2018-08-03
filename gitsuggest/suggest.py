@@ -17,6 +17,10 @@ from gensim import corpora, models
 from nltk.corpus import words, stopwords
 from nltk.tokenize import RegexpTokenizer
 
+import requests
+
+from requests.auth import HTTPBasicAuth
+
 
 class GitSuggest(object):
     """Class to suggest git repositories for a user."""
@@ -58,7 +62,8 @@ class GitSuggest(object):
         # Populate repositories to be used for generating suggestions.
         self.user_starred_repositories = list()
         self.user_following_starred_repositories = list()
-        self.__populate_repositories_of_interest(username)
+        #self.__populate_repositories_of_interest(username)
+        self.__populate_repositories_of_interest_graphQL(username)
 
         # Construct LDA model.
         self.lda_model = None
@@ -110,6 +115,64 @@ class GitSuggest(object):
                 a_minus_b.append(repo)
 
         return a_minus_b
+    
+    def __run_query(self, query):
+        URL = 'https://api.github.com/graphql'
+
+        request = requests.post(URL, json=query,auth=HTTPBasicAuth('gleisonbt', 'Aleister93'))
+
+        if request.status_code == 200:
+            return request.json()
+        else:
+            raise Exception("Query failed to run by returning code of {}. {}".format(request.status_code, query))
+
+    def __populate_repositories_of_interest_graphQL(self, username):
+        query = """
+        query userGetStarred($username: String!){
+            user(login: $username){
+                starredRepositories(first:100){
+                nodes{
+                    nameWithOwner
+                    description
+                    stargazers{
+                    totalCount
+                    }
+                }
+                }
+                following(first:100){
+                nodes{
+                    starredRepositories(first:100){
+                        nodes{
+                            nameWithOwner
+                        description
+                        stargazers{
+                        totalCount
+                        }
+                        }
+                        }
+                }
+                }
+            }
+        }
+        """
+
+        json = {
+            "query": query, "variables":{
+                "username": username
+            }
+        }
+
+        #listRepos = []
+        result = self.__run_query(json)
+        starredRepos = result["data"]["user"]["starredRepositories"]["nodes"]
+        for repo in starredRepos:
+            self.user_starred_repositories.append(Repo(repo['nameWithOwner'], repo['description'], repo['stargazers']['totalCount']))
+
+        followingsData = result["data"]["user"]["following"]["nodes"]
+        for following in followingsData:
+            for repo in following["starredRepositories"]["nodes"]:
+                self.user_following_starred_repositories.append(Repo(repo['nameWithOwner'], repo['description'], repo['stargazers']['totalCount']))
+
 
     def __populate_repositories_of_interest(self, username):
         """Method to populate repositories which will be used to suggest
@@ -154,6 +217,7 @@ class GitSuggest(object):
 
         # Extract descriptions out of repositories of interest.
         repo_descriptions = [repo.description for repo in repos_of_interest]
+
         return list(set(repo_descriptions))
 
     def __get_words_to_ignore(self):
@@ -276,7 +340,44 @@ class GitSuggest(object):
         repo_query_terms = list()
         for term in self.lda_model.get_topic_terms(0, topn=term_count):
             repo_query_terms.append(self.lda_model.id2word[term[0]])
+
         return " ".join(repo_query_terms)
+
+    def __get_repos_for_query_graphQL(self, query):
+        query2 = """
+            query queryByItems($queryString: String!){
+                search(query:$queryString, type:REPOSITORY, first: 100){
+                    nodes{
+                    ... on Repository{
+                        nameWithOwner
+                            description
+                            stargazers{
+                            totalCount
+                            }
+                        }
+                    }
+                }
+            }
+        """
+
+        json = {
+            "query": query2, "variables":{
+                "queryString": query
+            }
+        }
+
+        result = self.__run_query(json)
+
+        listRepos = []
+
+        repos = result["data"]["search"]["nodes"]
+        for repo in repos:
+            listRepos.append(Repo(repo['nameWithOwner'], repo['description'], repo['stargazers']['totalCount']))
+
+
+        return sorted(listRepos, key=lambda repo: repo.stargazers_count, reverse = True)
+
+
 
     def __get_repos_for_query(self, query):
         """Method to procure git repositories for the query provided.
@@ -287,6 +388,7 @@ class GitSuggest(object):
         :param query: String representing the repositories intend to search.
         :return: Iterator for repositories found using the query.
         """
+
         return self.github.search_repositories(
             query, "stars", "desc"
         ).get_page(
@@ -303,7 +405,7 @@ class GitSuggest(object):
             repository_set = list()
             for term_count in range(5, 2, -1):
                 query = self.__get_query_for_repos(term_count=term_count)
-                repository_set.extend(self.__get_repos_for_query(query))
+                repository_set.extend(self.__get_repos_for_query_graphQL(query))
 
             # Remove repositories authenticated user is already interested in.
             catchy_repos = GitSuggest.minus(
@@ -337,3 +439,9 @@ class GitSuggest(object):
         # Return an iterator to help user fetch the repository listing.
         for repository in self.suggested_repositories:
             yield repository
+
+class Repo:
+    def __init__(self, full_name, description, stargazers_count):
+        self.full_name = full_name
+        self.description = description
+        self.stargazers_count = stargazers_count
